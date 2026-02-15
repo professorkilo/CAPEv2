@@ -53,6 +53,8 @@ ram_boost = no
 # https://capev2.readthedocs.io/en/latest/usage/patterns_replacement.html
 replace_patterns = no
 file_activities = no
+# Get network details from behavior
+network_map = no
 
 # process behavior files in ram to speedup processing a little bit?
 ram_mmap = no
@@ -226,6 +228,10 @@ max_file_size = 90
 userdb_signature = no
 # https://capev2.readthedocs.io/en/latest/usage/patterns_replacement.html
 replace_patterns = no
+# Use file cache to speed up processing by looking up already processed files in MongoDB
+file_cache = no
+# Store pefile objects for later usage? useful if you doing something in signatures/reporting
+pefile_store = no
 
 # Deduplicate screenshots - You need to install dependency ImageHash>=4.3.1
 [deduplication]
