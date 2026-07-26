@@ -1,3 +1,21 @@
+### [15.07.2026]
+* Monitor update: Fix issue with NtWriteFile hook causing detonation failures (e.g. 9b1717eb154011b52aa24e4d6848976a9aafff2665f3171265aa767d5951be6c)
+
+### [07.07.2026]
+* Monitor updates:
+    * New hooks for SystemFunction036, SystemFunction040, SystemFunction041 (RtlGenRandom, RtlEncryptMemory, RtlDecryptMemory), Thread32First, Thread32Next, clipboard functions
+    * Enable hooks: MapFileAndCheckSumA, GetVolumeInformationA, GetVolumeInformationW & NtQueryVolumeInformationFile
+    * Crypto hook overhaul
+    * Misc fixes
+
+### [08.06.2026]
+* Threat Discovery & Hunting Workstation Dashboard:
+    * Integrated centralized dynamic multi-faceted database clustering across 12 categories (Domains, IPs, Mutexes, Dropped Files, Commands, Registry Keys, Hashes, ImpHashes, and Signatures).
+    * Created dynamic, cascading, auto-reloaded JSON configuration cacher (`conf/hunt.json`) with hierarchical lookup order (`custom/conf` ➔ `conf` ➔ `conf/default`).
+    * Built high-performance, memory-speed caching system utilizing OS modification-time (`mtime`) checks for instant reloading without disk parsing or server restarts.
+    * Integrated inline threat intelligence OSINT pivoting links (VirusTotal, Shodan, Censys, MalwareBazaar, and AlienVault OTX) and transaction-safe, sanitized AJAX-based task tagging group actions.
+    * Added comprehensive unit testing covering all view states, error handling, and security measures.
+
 ### [05.06.2026]
 * Monitor updates:
     * NtCreateUserProcess hook: Dynamically patch ping commandline to thwart ping delays (e.g. Formbook/Xloader)
