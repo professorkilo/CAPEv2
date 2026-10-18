@@ -6,11 +6,14 @@
 
 import argparse
 import hashlib
+import ipaddress
+import json
 import logging
 import os
 import re
 import queue
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -31,7 +34,6 @@ requests.packages.urllib3.disable_warnings()
 CUCKOO_ROOT = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..")
 sys.path.append(CUCKOO_ROOT)
 
-from lib.cuckoo.common.iocs import dump_iocs, load_iocs
 from lib.cuckoo.common.cleaners_utils import free_space_monitor
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.dist_db import ExitNodes, Machine, Node, Task, create_session
@@ -53,7 +55,6 @@ from lib.cuckoo.core.database import (
     init_database,
 )
 from lib.cuckoo.core.data.task import Task as MD_Task
-from dev_utils.mongodb import mongo_update_one
 
 cfg = Config()
 reporting_conf = Config("reporting")
@@ -328,6 +329,60 @@ def node_get_report(task_id, fmt, url, apikey, stream=False):
         log.critical("Error fetching report (task #%d, node %s): %s", task_id, url, e)
 
 
+VALID_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def validate_node_name(name: str) -> str:
+    if (
+        not isinstance(name, str)
+        or not VALID_NODE_NAME_RE.fullmatch(name)
+        or name in (".", "..")
+        or name.startswith("-")
+    ):
+        raise ValueError(f"Invalid node name: {name!r}")
+    return name
+
+
+def _is_private_nfs_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return bool(
+        ip.is_private
+        and not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast)
+    )
+
+
+def validate_nfs_hostname(hostname: str) -> str:
+    if not isinstance(hostname, str) or not hostname or hostname in (".", "..") or hostname.startswith("-"):
+        raise ValueError(f"Invalid NFS hostname: {hostname!r}")
+
+    clean_host = hostname.strip("[]")
+    try:
+        ip = ipaddress.ip_address(clean_host)
+    except ValueError:
+        if not VALID_NODE_NAME_RE.fullmatch(clean_host):
+            raise ValueError(f"Invalid NFS hostname: {hostname!r}")
+        try:
+            addr_info = socket.getaddrinfo(clean_host, None, proto=socket.IPPROTO_TCP)
+        except OSError as exc:
+            raise ValueError(f"Unable to resolve NFS hostname {hostname!r}: {exc}") from exc
+        if not addr_info:
+            raise ValueError(f"Unable to resolve NFS hostname: {hostname!r}")
+        resolved_ips = [ipaddress.ip_address(info[4][0]) for info in addr_info]
+        if not all(_is_private_nfs_ip(resolved_ip) for resolved_ip in resolved_ips):
+            raise ValueError(f"NFS hostname {hostname!r} resolves to a non-private IP address")
+        ip = resolved_ips[0]
+
+    if not _is_private_nfs_ip(ip):
+        raise ValueError(f"NFS host {hostname!r} ({ip}) is not a private network IP address")
+
+    allowed_cidrs = getattr(dist_conf.NFS, "allowed_networks", "") or ""
+    if allowed_cidrs.strip():
+        networks = [ipaddress.ip_network(cidr.strip(), strict=False) for cidr in allowed_cidrs.split(",") if cidr.strip()]
+        if networks and not any(ip in net for net in networks):
+            raise ValueError(f"NFS host {hostname!r} ({ip}) is outside configured allowed_networks")
+
+    return f"[{ip}]" if ip.version == 6 else str(ip)
+
+
 def node_get_report_nfs(task_id, worker_name, main_task_id) -> bool:
     """
     Retrieves a report from a worker node via NFS and copies it to the main task's analysis directory.
@@ -346,7 +401,11 @@ def node_get_report_nfs(task_id, worker_name, main_task_id) -> bool:
     Logs:
         Error messages if the worker node is not mounted, the file does not exist, or if there is an exception during copying.
     """
-    worker_path = os.path.join(CUCKOO_ROOT, dist_conf.NFS.mount_folder, str(worker_name))
+    worker_name = validate_node_name(str(worker_name))
+    base_dir = os.path.realpath(os.path.join(CUCKOO_ROOT, dist_conf.NFS.mount_folder))
+    worker_path = os.path.realpath(os.path.join(base_dir, worker_name))
+    if os.path.commonpath([base_dir, worker_path]) != base_dir or worker_path == base_dir:
+        raise ValueError(f"Worker path escapes mount_folder: {worker_name!r}")
 
     if not path_mount_point(worker_path):
         log.error("[-] Worker: %s is not mounted to: %s!", worker_name, worker_path)
@@ -505,6 +564,15 @@ def node_submit_task(task_id, node_id, main_task_id, db=None):
             if task.tags[-1] == ",":
                 task.tags = task.tags[:-1]
         apikey = node.apikey
+        task_attributes = {"main_task_id": task.main_task_id}
+        if task.category in ("file", "pcap", "static"):
+            try:
+                with main_db.session.begin():
+                    if parent_sample := main_db.get_parent_sample_from_task(task.main_task_id):
+                        task_attributes["parent_sample"] = parent_sample.to_dict()
+            except Exception as e:
+                log.warning("Failed to fetch parent_sample for main_task_id %s: %s", task.main_task_id, e)
+        attributes_json = json.dumps(task_attributes)
         data = dict(
             package=task.package,
             timeout=task.timeout,
@@ -519,6 +587,7 @@ def node_submit_task(task_id, node_id, main_task_id, db=None):
             enforce_timeout=task.enforce_timeout,
             route=task.route,
             tlp=task.tlp,
+            attributes=attributes_json,
         )
 
         r = None
@@ -573,7 +642,7 @@ def node_submit_task(task_id, node_id, main_task_id, db=None):
             try:
                 r = requests.post(
                     url,
-                    data={"url": task.path, "options": task.options},
+                    data={"url": task.path, "options": task.options, "attributes": attributes_json},
                     headers={"Authorization": f"Token {apikey}"},
                     verify=False,
                     timeout=request_timeout,
@@ -1080,8 +1149,6 @@ class Retriever(threading.Thread):
                     dbg_line = f"[PERF  ] Copied CAPE ID: {t.main_task_id} (Worker ID: {t.task_id}) in {timediff:.2f}s"
                     log.debug(dbg_line)
                     self.cleaner_queue.put((node_id, task.get("id")))
-                    # this doesn't exist for some reason
-                    sample_parent = None
                     hashes = {}
                     if path_exists(t.path):
                         sample_sha256 = None
@@ -1092,12 +1159,6 @@ class Retriever(threading.Thread):
                                 hashes["sha256"] = samples[0].sample.sha256
                                 hashes["md5"] = samples[0].sample.md5
                                 hashes["sha1"] = samples[0].sample.sha1
-
-                                if hasattr(samples[0].sample, "parent_links"):
-                                    for parent in samples[0].sample.parent_links:
-                                        if parent.task_id == t.main_task_id:
-                                            sample_parent = parent.parent.to_dict()
-                                            break
 
                         if sample_sha256 is None:
                             # keep fallback for now
@@ -1120,19 +1181,6 @@ class Retriever(threading.Thread):
                                 pass
 
                         self.delete_target_file(t.main_task_id, sample_sha256, t.path)
-
-                    if sample_parent:
-                        try:
-                            report = load_iocs(t.main_task_id, detail=True)
-                            if report:
-                                report["info"].update({"parent_sample": sample_parent})
-                                dump_iocs(report, t.main_task_id)
-                            # ToDo insert into mongo
-                            mongo_update_one(
-                                "analysis", {"info.id": int(t.main_task_id)}, {"$set": {"info.parent_sample": sample_parent}}
-                            )
-                        except Exception as e:
-                            log.exception("Failed to save iocs for parent sample: %s", str(e))
 
                     if GCS_ENABLED:
                         metadata = gcs_uploader.parse_custom_string(t.custom)
@@ -1382,9 +1430,6 @@ class StatusThread(threading.Thread):
                     if options.get("node"):
                         del options["node"]
                     t.options = ",".join([f"{k}={v}" for k, v in options.items()])
-                    if t.options:
-                        t.options += ","
-                    t.options += f"main_task_id={t.id}"
                     args = dict(
                         package=t.package,
                         category=t.category,
@@ -1843,12 +1888,15 @@ def cron_cleaner(clean_x_hours=False):
 
 def create_app(database_connection):
     from pydantic import BaseModel
+    from fastapi import Depends, HTTPException, Security
+    from fastapi.security import APIKeyHeader
 
     class NodeRegister(BaseModel):
         name: str
         url: str
         apikey: str = ""
         enabled: Optional[bool] = None
+        nfs_host: Optional[str] = None
 
     class NodeUpdate(BaseModel):
         url: Optional[str] = None
@@ -1856,7 +1904,15 @@ def create_app(database_connection):
         exitnodes: Optional[bool] = None
         enabled: Optional[bool] = None
 
-    app = FastAPI(title="Distributed CAPE")
+    AUTH_TOKEN = dist_conf.distributed.get("auth_token")
+
+    api_key_header = APIKeyHeader(name="X-API-Token", auto_error=False)
+
+    def verify_auth_token(api_key: str = Security(api_key_header)):
+        if AUTH_TOKEN and api_key != AUTH_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid or missing auth token")
+
+    app = FastAPI(title="Distributed CAPE", dependencies=[Depends(verify_auth_token)] if AUTH_TOKEN else [])
 
     @app.get("/node")
     def get_nodes():
@@ -1882,6 +1938,20 @@ def create_app(database_connection):
 
     @app.post("/node")
     def post_node(payload: NodeRegister):
+        try:
+            validate_node_name(payload.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        nfs_host = None
+        if NFS_FETCH:
+            hostname = payload.nfs_host or urlparse(payload.url).hostname or urlparse(payload.url).netloc.split(":")[0]
+            if hostname != main_server_name:
+                try:
+                    nfs_host = validate_nfs_hostname(hostname)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         with session() as db:
             node_exist = False
             # On autoscaling we might get the same name but different IP for server. Kinda PUT friendly POST
@@ -1919,11 +1989,9 @@ def create_app(database_connection):
                 db.add(node)
             db.commit()
 
-        if NFS_FETCH:
+        if NFS_FETCH and nfs_host:
             # Add entry to /etc/fstab, create folder and mount server
-            hostname = urlparse(payload.url).netloc.split(":")[0]
-            if hostname != main_server_name:
-                send_socket_command(dist_conf.NFS.fstab_socket, "add_entry", *[hostname, payload.name])
+            send_socket_command(dist_conf.NFS.fstab_socket, "add_entry", *[nfs_host, payload.name])
 
         return dict(name=payload.name, machines=machines, exitnodes=exitnodes)
 
@@ -2158,6 +2226,11 @@ def list_nodes_cli():
 def register_node_cli(name, url, apikey, enabled):
     if not name or not url:
         print("Error: Registering a node requires both --node <name> and --url <url>")
+        sys.exit(1)
+    try:
+        validate_node_name(name)
+    except ValueError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
     with session() as db:
         node_exist = False
