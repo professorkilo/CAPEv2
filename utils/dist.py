@@ -5,6 +5,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import argparse
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -164,6 +165,20 @@ def restart_db_connection():
         logger.exception("Error while trying to restart database connection pool: %s", e)
 
 
+_DB_DISCONNECT_TERMS = (
+    "QueuePool",
+    "TimeoutError",
+    "connection timed out",
+    "Timeout 30.00",
+    "SSL connection has been closed unexpectedly",
+    "server closed the connection unexpectedly",
+    "SSL SYSCALL error",
+    "connection already closed",
+    "terminating connection",
+    "Can't reconnect until invalid transaction is rolled back",
+)
+
+
 class SessionWrapper:
     def __init__(self, session_obj):
         self._session = session_obj
@@ -176,7 +191,9 @@ class SessionWrapper:
                 try:
                     return attr(*args, **kwargs)
                 except Exception as e:
-                    if any(term in str(e) for term in ("QueuePool", "TimeoutError", "connection timed out", "Timeout 30.00")):
+                    if any(term in str(e) for term in _DB_DISCONNECT_TERMS):
+                        with contextlib.suppress(Exception):
+                            self._session.rollback()
                         restart_db_connection()
                     raise e
 
@@ -189,7 +206,9 @@ class SessionWrapper:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_val is not None:
-            if any(term in str(exc_val) for term in ("QueuePool", "TimeoutError", "connection timed out", "Timeout 30.00")):
+            if any(term in str(exc_val) for term in _DB_DISCONNECT_TERMS):
+                with contextlib.suppress(Exception):
+                    self._session.rollback()
                 restart_db_connection()
         return self._session.__exit__(exc_type, exc_val, exc_tb)
 
@@ -249,7 +268,7 @@ def node_fetch_tasks(status, url, apikey, action="fetch", since=0):
         params = dict(status=status, ids=True)
         if action == "fetch":
             params["completed_after"] = since
-        r = requests.get(url, params=params, headers={"Authorization": f"Token {apikey}"}, verify=False)
+        r = requests.get(url, params=params, headers={"Authorization": f"Token {apikey}"}, verify=False, timeout=30)
         if not r.ok:
             log.error("Error fetching task list. Status code: %d - %s. Saving error to /tmp/dist_error.html", r.status_code, r.url)
             _ = path_write_file("/tmp/dist_error.html", r.content)
@@ -953,68 +972,68 @@ class Retriever(threading.Thread):
         # self.thread_local.requests_session = requests.Session()
 
         while True:
-            if self.stop_dist.is_set():
+            if getattr(self, "stop_dist", None) and self.stop_dist.is_set():
                 time.sleep(60)
                 continue
             with session() as db:
                 try:
-                    nodes = db.scalars(select(Node).where(Node.enabled.is_(True)))
+                    nodes = db.scalars(select(Node).where(Node.enabled.is_(True))).all()
+                    for node in nodes:
+                        self.status_count.setdefault(node.name, 0)
+                        last_checks.setdefault(node.name, 0)
+                        last_checks[node.name] += 1
+
+                        if hasattr(node, "last_check") and node.last_check:
+                            last_check = int(node.last_check.timestamp())
+                        else:
+                            last_check = 0
+
+                        # reset it every 10 calls
+                        if last_checks[node.name] == 3:
+                            last_check = 0
+                            last_checks[node.name] = 0
+
+                        tasks_data = node_fetch_tasks("reported", node.url, node.apikey, "fetch", last_check)
+                        if tasks_data is None:
+                            self.status_count[node.name] += 1
+                            if self.status_count[node.name] >= dead_count:
+                                log.warning(
+                                    "[-] Node %s is unreachable/dead (attempt %d/%d)",
+                                    node.name,
+                                    self.status_count[node.name],
+                                    dead_count,
+                                )
+                            continue
+                        else:
+                            self.status_count[node.name] = 0
+
+                        task_ids = [task["id"] for task in tasks_data]
+
+                        if task_ids:
+                            stmt = select(Task.task_id).where(
+                                Task.finished.is_(False),
+                                Task.retrieved.is_(False),
+                                Task.node_id == node.id,
+                                Task.deleted.is_(False),
+                                Task.task_id.in_(task_ids),
+                            )
+                            tasks_to_fetch = db.scalars(stmt).all()
+
+                            processed_task_ids = set(self.current_queue.get(node.id, []))
+                            try:
+                                queue_task_ids = {t[0]["id"] for t in list(self.fetcher_queue.queue) if t[1] == node.id}
+                            except TypeError:
+                                print("queue_task_ids", self.fetcher_queue.queue)
+                                queue_task_ids = set()
+
+                            for task_id in tasks_to_fetch:
+                                if task_id not in processed_task_ids and task_id not in queue_task_ids:
+                                    self.fetcher_queue.put(({"id": task_id}, node.id))
+                    db.commit()
                 except SQLAlchemyError as e:
                     log.error("Database error in fetcher: %s", e)
-                    continue
-                for node in nodes:
-                    self.status_count.setdefault(node.name, 0)
-                    last_checks.setdefault(node.name, 0)
-                    last_checks[node.name] += 1
-
-                    if hasattr(node, "last_check") and node.last_check:
-                        last_check = int(node.last_check.timestamp())
-                    else:
-                        last_check = 0
-
-                    # reset it every 10 calls
-                    if last_checks[node.name] == 3:
-                        last_check = 0
-                        last_checks[node.name] = 0
-
-                    tasks_data = node_fetch_tasks("reported", node.url, node.apikey, "fetch", last_check)
-                    if tasks_data is None:
-                        self.status_count[node.name] += 1
-                        if self.status_count[node.name] >= dead_count:
-                            log.warning(
-                                "[-] Node %s is unreachable/dead (attempt %d/%d)",
-                                node.name,
-                                self.status_count[node.name],
-                                dead_count,
-                            )
-                        continue
-                    else:
-                        self.status_count[node.name] = 0
-
-                    task_ids = [task["id"] for task in tasks_data]
-
-                    if task_ids:
-                        stmt = select(Task.task_id).where(
-                            Task.finished.is_(False),
-                            Task.retrieved.is_(False),
-                            Task.node_id == node.id,
-                            Task.deleted.is_(False),
-                            Task.task_id.in_(task_ids),
-                        )
-                        tasks_to_fetch = db.scalars(stmt).all()
-
-                        processed_task_ids = set(self.current_queue.get(node.id, []))
-                        try:
-                            queue_task_ids = {t[0]["id"] for t in list(self.fetcher_queue.queue) if t[1] == node.id}
-                        except TypeError:
-                            print("queue_task_ids", self.fetcher_queue.queue)
-                            queue_task_ids = set()
-
-                        for task_id in tasks_to_fetch:
-                            if task_id not in processed_task_ids and task_id not in queue_task_ids:
-                                self.fetcher_queue.put(({"id": task_id}, node.id))
-                db.commit()
-                time.sleep(5)
+                    db.rollback()
+            time.sleep(5)
 
     def delete_target_file(self, task_id: int, sample_sha256: str, target: str):
         """
@@ -1099,7 +1118,7 @@ class Retriever(threading.Thread):
                     t = db.scalar(stmt)
                     if t is None:
                         # print(type(self.t_is_none.get(node_id)))
-                        self.t_is_none.setdefault(node_id, []).append(task["id"])
+                        self.t_is_none.setdefault(node_id, set()).add(task["id"])
 
                         # sometime it not deletes tasks in workers of some fails or something
                         # this will do the trick
@@ -2075,87 +2094,7 @@ def create_app(database_connection):
     return app
 
 
-class ColoredFormatter(logging.Formatter):
-    GREY = "\x1b[38;20m"
-    GREEN = "\x1b[32;20m"
-    YELLOW = "\x1b[33;20m"
-    RED = "\x1b[31;20m"
-    BOLD_RED = "\x1b[31;1m"
-    CYAN = "\x1b[36;20m"
-    RESET = "\x1b[0m"
-
-    # Pre-compiled regex patterns (C-level high-performance parsing)
-    RE_WORKER = re.compile(r"\b(cape-worker[-\w]*)\b", re.IGNORECASE)
-    RE_SETSTAT = re.compile(r"\b(task)\b\s+(\d+)\s+(status)", re.IGNORECASE)
-    RE_MAIN_TASK = re.compile(
-        r"\b(main(?:_task)?_id|main|analysis(?:[\s_-]?id)?|cape(?:[\s_-]?id)?)\b[:\s=]+([\d,]+)", re.IGNORECASE
-    )
-    RE_WORKER_TASK = re.compile(r"\b(task(?:s|\(s\))?|task_id|worker(?:[\s_-]?id)?)\b[:\s=]+([\d,]+)", re.IGNORECASE)
-    RE_PERF = re.compile(r"\bin\s+([0-9.]+s)\b")
-
-    FORMATS = {
-        logging.DEBUG: f"%(asctime)s [{CYAN}%(levelname)-7s{RESET}] %(module)-8s (%(threadName)s): %(message)s",
-        logging.INFO: f"%(asctime)s [{GREEN}%(levelname)-7s{RESET}] %(module)-8s (%(threadName)s): %(message)s",
-        logging.WARNING: f"%(asctime)s [{YELLOW}%(levelname)-7s{RESET}] %(module)-8s (%(threadName)s): %(message)s",
-        logging.ERROR: f"%(asctime)s [{RED}%(levelname)-7s{RESET}] %(module)-8s (%(threadName)s): %(message)s",
-        logging.CRITICAL: f"%(asctime)s [{BOLD_RED}%(levelname)-7s{RESET}] %(module)-8s (%(threadName)s): %(message)s",
-    }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno, "%(asctime)s [%(levelname)-7s] %(module)-8s (%(threadName)s): %(message)s")
-        formatter = logging.Formatter(log_fmt)
-        formatted_message = formatter.format(record)
-
-        # ANSI Colors
-        BOLD_CYAN = "\x1b[36;1m"
-        BOLD_GREEN = "\x1b[32;1m"
-        BOLD_YELLOW = "\x1b[33;1m"
-        BOLD_MAGENTA = "\x1b[35;1m"
-        BOLD_BLUE = "\x1b[34;1m"
-        BOLD_RED = "\x1b[31;1m"
-        CYAN = "\x1b[36m"
-        GREEN = "\x1b[32m"
-        YELLOW = "\x1b[33m"
-        MAGENTA = "\x1b[35m"
-        RESET = "\x1b[0m"
-
-        # 1. Highlight all worker/node names dynamically (e.g. "cape-worker", "cape-worker-2")
-        formatted_message = self.RE_WORKER.sub(rf"{CYAN}\1{RESET}", formatted_message)
-
-        # 2. Highlight specialized parent/main task updates first (e.g. "task 3319058 status")
-        formatted_message = self.RE_SETSTAT.sub(rf"\1 {MAGENTA}\2{RESET} \3", formatted_message)
-
-        # 3. Highlight parent/main task IDs (e.g. "Main ID: 3319058", "Main: 3319058", "main_task_id=3319058", "analysis ID 3319058", "analysis 3319058")
-        formatted_message = self.RE_MAIN_TASK.sub(rf"\1: {MAGENTA}\2{RESET}", formatted_message)
-
-        # 4. Highlight general task IDs (e.g. "Task: 16399266", "Task(s): 614534,614541", "task_id=495972")
-        formatted_message = self.RE_WORKER_TASK.sub(rf"\1: {YELLOW}\2{RESET}", formatted_message)
-
-        # 5. Highlight performance copy benchmarks (e.g. "in 0.08s", "in 0.15s")
-        formatted_message = self.RE_PERF.sub(rf"in {GREEN}\1{RESET}", formatted_message)
-
-        # 6. Highlight core operations
-        replacements = {
-            "[FETCH ]": f"{BOLD_GREEN}[FETCH ]{RESET}",
-            "[SUBMIT]": f"{BOLD_CYAN}[SUBMIT]{RESET}",
-            "[REMOVE]": f"{BOLD_RED}[REMOVE]{RESET}",
-            "[GCS   ]": f"{BOLD_MAGENTA}[GCS   ]{RESET}",
-            "[PERF  ]": f"{BOLD_YELLOW}[PERF  ]{RESET}",
-        }
-
-        for old, new in replacements.items():
-            if old in formatted_message:
-                formatted_message = formatted_message.replace(old, new)
-
-        # 7. Highlight Status Metrics
-        if "STATUS | " in formatted_message:
-            formatted_message = formatted_message.replace("STATUS |", f"{BOLD_BLUE}STATUS{RESET} |")
-            formatted_message = formatted_message.replace("Pend:", f"{BOLD_YELLOW}Pend:{RESET}")
-            formatted_message = formatted_message.replace("Run:", f"{BOLD_GREEN}Run:{RESET}")
-            formatted_message = formatted_message.replace("Done:", f"{BOLD_BLUE}Done:{RESET}")
-            formatted_message = formatted_message.replace("Rep:", f"{BOLD_MAGENTA}Rep:{RESET}")
-
-        return formatted_message
+from lib.cuckoo.core.log import ColoredFormatter, init_json_file_handler
 
 
 def init_logging(debug=False):
@@ -2172,9 +2111,16 @@ def init_logging(debug=False):
     fh = handlers.TimedRotatingFileHandler(os.path.join(CUCKOO_ROOT, "log", "dist.log"), when="midnight", backupCount=10)
     fh.setFormatter(formatter)
     log.addHandler(fh)
+    init_json_file_handler(
+        log,
+        "dist.log",
+        service_name="cape-dist",
+        logconf=Config("logging"),
+        backup_count=10,
+    )
 
     handler_stdout = logging.StreamHandler(sys.stdout)
-    handler_stdout.setFormatter(ColoredFormatter())
+    handler_stdout.setFormatter(ColoredFormatter(fmt_with_thread=True, stream=sys.stdout))
     log.addHandler(handler_stdout)
 
     if debug:
@@ -2424,13 +2370,14 @@ else:
 
     # this allows run it with gunicorn/uwsgi
     log = init_logging(True)
-    if not dist_conf.distributed.get("submit_only"):
-        retrieve = Retriever(name="supervisor")
-        retrieve.daemon = True
-        retrieve.start()
-    else:
-        log.info("Submit-only mode (config): Retriever thread disabled.")
+    if "pytest" not in sys.modules:
+        if not dist_conf.distributed.get("submit_only"):
+            retrieve = Retriever(name="supervisor")
+            retrieve.daemon = True
+            retrieve.start()
+        else:
+            log.info("Submit-only mode (config): Retriever thread disabled.")
 
-    t = StatusThread(name="status")
-    t.daemon = True
-    t.start()
+        t = StatusThread(name="status")
+        t.daemon = True
+        t.start()
